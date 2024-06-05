@@ -22,6 +22,7 @@
 
 #include <webview/webview.hpp>
 #include <crl/crl.h>
+#include <crl/crl_object_on_thread.h>
 #include <regex>
 
 namespace Webview::WebKitGTK {
@@ -108,10 +109,12 @@ private:
 	void registerHelperMethodHandlers();
 
 	bool _remoting = false;
-	bool _connected = false;
 	Master _master;
 	Helper _helper;
-	Gio::DBusServer _dbusServer;
+	std::optional<crl::object_on_thread<Gio::DBusServer>> _dbusServer;
+	GLib::MainLoop _dbusServerLoop;
+	std::mutex _dbusServerLoopMutex;
+	std::mutex _dbusServerLoopDestructionMutex;
 	Gio::DBusObjectManagerServer _dbusObjectManager;
 	Gio::Subprocess _serviceProcess;
 
@@ -165,6 +168,8 @@ Instance::~Instance() {
 			gtk_widget_destroy(_window);
 		}
 	}
+
+	std::unique_lock lock(_dbusServerLoopDestructionMutex);
 }
 
 bool Instance::create(Config config) {
@@ -215,26 +220,16 @@ bool Instance::create(Config config) {
 			return false;
 		}
 
-		const ::base::has_weak_ptr guard;
-		std::optional<bool> success;
-		const auto debug = _debug;
-		const auto r = config.opaqueBg.red();
-		const auto g = config.opaqueBg.green();
-		const auto b = config.opaqueBg.blue();
-		const auto a = config.opaqueBg.alpha();
-		const auto path = config.userDataPath;
-		_helper.call_create(debug, r, g, b, a, path, crl::guard(&guard, [&](
-				GObject::Object source_object,
-				Gio::AsyncResult res) {
-			success = _helper.call_create_finish(res, nullptr);
-			GLib::MainContext::default_().wakeup();
-		}));
+		const auto success = _helper.call_create_sync(
+			_debug,
+			config.opaqueBg.red(),
+			config.opaqueBg.green(),
+			config.opaqueBg.blue(),
+			config.opaqueBg.alpha(),
+			config.userDataPath,
+			nullptr);
 
-		while (!success && _connected) {
-			GLib::MainContext::default_().iteration(true);
-		}
-
-		if (success.value_or(false) && !_compositor) {
+		if (success && !_compositor) {
 			_widget.reset(
 				QWidget::createWindowContainer(
 					QWindow::fromWinId(WId(winId())),
@@ -242,7 +237,7 @@ bool Instance::create(Config config) {
 					Qt::FramelessWindowHint));
 			_widget->show();
 		}
-		return success.value_or(false);
+		return success;
 	}
 
 	_window = _wayland
@@ -516,21 +511,19 @@ ResolveResult Instance::resolve() {
 			return ResolveResult::IPCFailure;
 		}
 
-		const ::base::has_weak_ptr guard;
+		auto loop = GLib::MainLoop::new_();
 		std::optional<ResolveResult> result;
-		_helper.call_resolve(crl::guard(&guard, [&](
+		_helper.call_resolve([&](
 				GObject::Object source_object,
 				Gio::AsyncResult res) {
 			const auto reply = _helper.call_resolve_finish(res);
 			if (reply) {
 				result = ResolveResult(std::get<1>(*reply));
 			}
-			GLib::MainContext::default_().wakeup();
-		}));
+			loop.quit();
+		});
 
-		while (!result && _connected) {
-			GLib::MainContext::default_().iteration(true);
-		}
+		loop.run();
 
 		if (!_wayland && result && *result != ResolveResult::Success) {
 			_wayland = true;
@@ -643,21 +636,11 @@ void *Instance::winId() {
 			return nullptr;
 		}
 
-		const ::base::has_weak_ptr guard;
 		std::optional<void*> ret;
-		_helper.call_get_win_id(crl::guard(&guard, [&](
-				GObject::Object source_object,
-				Gio::AsyncResult res) {
-			const auto reply = _helper.call_get_win_id_finish(res);
-			ret = reply
-				? reinterpret_cast<void*>(std::get<1>(*reply))
-				: nullptr;
-			GLib::MainContext::default_().wakeup();
-		}));
-
-		while (!ret && _connected) {
-			GLib::MainContext::default_().iteration(true);
-		}
+		const auto reply = _helper.call_get_win_id_sync();
+		ret = reply
+			? reinterpret_cast<void*>(std::get<1>(*reply))
+			: nullptr;
 
 		return ret.value_or(nullptr);
 	}
@@ -707,7 +690,8 @@ void Instance::resizeToWindow() {
 }
 
 void Instance::startProcess() {
-	auto loop = GLib::MainLoop::new_();
+	auto context = GLib::MainContext::new_();
+	auto loop = GLib::MainLoop::new_(context, false);
 
 	auto serviceProcess = Gio::Subprocess::new_({
 		::base::Integration::Instance().executablePath().toStdString(),
@@ -739,101 +723,155 @@ void Instance::startProcess() {
 				GLib::path_get_basename(socketPath + "-wayland")));
 	}
 
-	auto authObserver = Gio::DBusAuthObserver::new_();
-	authObserver.signal_authorize_authenticated_peer().connect([=](
-			Gio::DBusAuthObserver,
-			Gio::IOStream stream,
-			Gio::Credentials credentials) {
-		return credentials.get_unix_pid(nullptr)
-			== std::stoi(_serviceProcess.get_identifier());
+	bool error = false;
+	_dbusServer.emplace();
+	_dbusServer->with_sync([&](Gio::DBusServer &dbusServer) {
+		GLib::MainContext::new_().push_thread_default();
+
+		auto authObserver = Gio::DBusAuthObserver::new_();
+		authObserver.signal_authorize_authenticated_peer().connect([=](
+				Gio::DBusAuthObserver,
+				Gio::IOStream stream,
+				Gio::Credentials credentials) {
+			return credentials.get_unix_pid(nullptr)
+				== std::stoi(_serviceProcess.get_identifier());
+		});
+
+		auto result = Gio::DBusServer::new_sync(
+			SocketPathToDBusAddress(socketPath),
+			Gio::DBusServerFlags::NONE_,
+			Gio::dbus_generate_guid(),
+			authObserver,
+			{});
+
+		if (!result) {
+			LOG(("WebView Error: %1.").arg(
+				result.error().message_().c_str()));
+			return;
+		}
+
+		dbusServer = *result;
+		dbusServer.start();
 	});
 
-	auto dbusServer = Gio::DBusServer::new_sync(
-		SocketPathToDBusAddress(socketPath),
-		Gio::DBusServerFlags::NONE_,
-		Gio::dbus_generate_guid(),
-		authObserver,
-		{});
-
-	if (!dbusServer) {
-		LOG(("WebView Error: %1.").arg(
-			dbusServer.error().message_().c_str()));
+	if (error) {
 		return;
 	}
 
-	_dbusServer = *dbusServer;
-	_dbusServer.start();
-	const ::base::has_weak_ptr guard;
-	auto started = ulong();
-	const auto newConnection = _dbusServer.signal_new_connection().connect([&](
-			Gio::DBusServer,
-			Gio::DBusConnection connection) {
-		_master = MasterSkeleton::new_();
-		auto object = ObjectSkeleton::new_(kMasterObjectPath);
-		object.set_master(_master);
-		_dbusObjectManager = Gio::DBusObjectManagerServer::new_(kObjectPath);
-		_dbusObjectManager.export_(object);
-		_dbusObjectManager.set_connection(connection);
-		registerMasterMethodHandlers();
+	const auto weak = ::base::make_weak(this);
+	_dbusServer->with_sync([=](Gio::DBusServer &dbusServer) {
+		const auto newConnection = std::make_shared<ulong>();
+		*newConnection = dbusServer.signal_new_connection().connect([=](
+				Gio::DBusServer,
+				Gio::DBusConnection connection) mutable {
+			auto master = MasterSkeleton::new_();
+			auto object = ObjectSkeleton::new_(kMasterObjectPath);
+			object.set_master(master);
+			auto dbusObjectManager = Gio::DBusObjectManagerServer::new_(
+				kObjectPath);
+			dbusObjectManager.export_(object);
+			dbusObjectManager.set_connection(connection);
 
-		HelperProxy::new_(
-			connection,
-			Gio::DBusProxyFlags::NONE_,
-			kHelperObjectPath,
-			crl::guard(&guard, [&](
+			context.invoke_full(
+				GLib::PRIORITY_DEFAULT_,
+				crl::guard(weak, [=]() mutable {
+					_master = master;
+					_dbusObjectManager = dbusObjectManager;
+					registerMasterMethodHandlers();
+					return false;
+				}));
+
+			HelperProxy::new_(
+				connection,
+				Gio::DBusProxyFlags::NONE_,
+				kHelperObjectPath,
+				[=](
 					GObject::Object source_object,
-					Gio::AsyncResult res) {
-				auto helper = HelperProxy::new_finish(res);
-				if (!helper) {
+					Gio::AsyncResult res) mutable {
+				auto helperProxy = HelperProxy::new_finish(res);
+				if (!helperProxy) {
 					LOG(("WebView Error: %1").arg(
-						helper.error().message_().c_str()));
+						helperProxy.error().message_().c_str()));
 					loop.quit();
 					return;
 				}
 
-				_helper = *helper;
-
-				started = _helper.signal_started().connect([&](Helper) {
-					_connected = true;
+				auto helper = Helper(*helperProxy);
+				const auto started = std::make_shared<ulong>();
+				*started = helper.signal_started().connect([=](
+						Helper) mutable {
 					loop.quit();
+					helper.disconnect(*started);
 				});
-			}));
 
-		connection.signal_closed().connect(crl::guard(this, [=](
-				Gio::DBusConnection,
-				bool remotePeerVanished,
-				GLib::Error_Ref error) {
-			_connected = false;
-			_widget = nullptr;
-			GLib::MainContext::default_().wakeup();
-		}));
+				context.invoke_full(
+					GLib::PRIORITY_DEFAULT_,
+					crl::guard(weak, [=]() mutable {
+						_helper = helper;
+						return false;
+					}));
+			});
 
-		return true;
+			connection.signal_closed().connect([=](
+					Gio::DBusConnection,
+					bool remotePeerVanished,
+					GLib::Error_Ref error) {
+				crl::on_main(weak, [=] {
+					_widget = nullptr;
+				});
+			});
+
+			dbusServer.disconnect(*newConnection);
+			return true;
+		});
+	});
+
+	_dbusServer->with([=](Gio::DBusServer &dbusServer) {
+		std::unique_lock lock(_dbusServerLoopDestructionMutex);
+		auto context = GLib::MainContext::get_thread_default();
+		{
+			std::unique_lock lock(_dbusServerLoopMutex);
+			_dbusServerLoop = GLib::MainLoop::new_(context, false);
+		}
+		_dbusServerLoop.run();
+		{
+			std::unique_lock lock(_dbusServerLoopMutex);
+			_dbusServerLoop = nullptr;
+		}
+		context.pop_thread_default();
 	});
 
 	// timeout in case something goes wrong
 	bool timeoutHappened = false;
-	const auto timeout = GLib::timeout_add_seconds_once(5, [&] {
+	auto timeout = GLib::timeout_source_new(5000);
+	timeout.set_callback(GLib::SourceFunc([&] {
 		timeoutHappened = true;
 		loop.quit();
-	});
+		return false;
+	}));
+	timeout.attach(context);
 
+	context.push_thread_default();
 	loop.run();
+	context.pop_thread_default();
+
 	if (timeoutHappened) {
 		LOG(("WebView Error: Timed out waiting for WebView helper process."));
-	} else {
-		GLib::Source::remove(timeout);
 	}
-	if (_helper && started) {
-		_helper.disconnect(started);
-	}
-	_dbusServer.disconnect(newConnection);
+	timeout.destroy();
 }
 
 void Instance::stopProcess() {
 	if (_serviceProcess) {
 		_serviceProcess.send_signal(SIGTERM);
 	}
+	{
+		std::unique_lock lock(_dbusServerLoopMutex);
+		if (_dbusServerLoop) {
+			_dbusServerLoop.quit();
+		}
+	}
+	_dbusServer.reset();
 	if (_compositor) {
 		_compositor->deleteLater();
 	}
@@ -870,12 +908,14 @@ void Instance::registerMasterMethodHandlers() {
 			Master,
 			Gio::DBusMethodInvocation invocation,
 			const std::string &message) {
-		if (_messageHandler) {
-			_messageHandler(message);
-			_master.complete_message_received(invocation);
-		} else {
-			invocation.return_gerror(MethodError());
-		}
+		crl::on_main(this, [=]() mutable {
+			if (_messageHandler) {
+				_messageHandler(message);
+				_master.complete_message_received(invocation);
+			} else {
+				invocation.return_gerror(MethodError());
+			}
+		});
 		return true;
 	});
 
@@ -884,20 +924,23 @@ void Instance::registerMasterMethodHandlers() {
 			Gio::DBusMethodInvocation invocation,
 			const std::string &uri,
 			bool newWindow) {
-		if (!_navigationStartHandler) {
-			invocation.return_gerror(MethodError());
-			return true;
-		}
-
-		_master.complete_navigation_started(invocation, [&] {
-			if (newWindow) {
-				if (_navigationStartHandler(uri, true)) {
-					QDesktopServices::openUrl(QString::fromStdString(uri));
-				}
-				return false;
+		crl::on_main(this, [=]() mutable {
+			if (!_navigationStartHandler) {
+				invocation.return_gerror(MethodError());
+				return;
 			}
-			return _navigationStartHandler(uri, false);
-		}());
+
+			_master.complete_navigation_started(invocation, [&] {
+				if (newWindow) {
+					if (_navigationStartHandler(uri, true)) {
+						QDesktopServices::openUrl(
+							QString::fromStdString(uri));
+					}
+					return false;
+				}
+				return _navigationStartHandler(uri, false);
+			}());
+		});
 
 		return true;
 	});
@@ -906,12 +949,14 @@ void Instance::registerMasterMethodHandlers() {
 			Master,
 			Gio::DBusMethodInvocation invocation,
 			bool success) {
-		if (_navigationDoneHandler) {
-			_navigationDoneHandler(success);
-			_master.complete_navigation_done(invocation);
-		} else {
-			invocation.return_gerror(MethodError());
-		}
+		crl::on_main(this, [=]() mutable {
+			if (_navigationDoneHandler) {
+				_navigationDoneHandler(success);
+				_master.complete_navigation_done(invocation);
+			} else {
+				invocation.return_gerror(MethodError());
+			}
+		});
 		return true;
 	});
 
@@ -921,27 +966,29 @@ void Instance::registerMasterMethodHandlers() {
 			int type,
 			const std::string &text,
 			const std::string &value) {
-		if (!_dialogHandler) {
-			invocation.return_gerror(MethodError());
-			return true;
-		}
+		crl::on_main(this, [=]() mutable {
+			if (!_dialogHandler) {
+				invocation.return_gerror(MethodError());
+				return;
+			}
 
-		const auto dialogType = (type == WEBKIT_SCRIPT_DIALOG_PROMPT)
-			? DialogType::Prompt
-			: (type == WEBKIT_SCRIPT_DIALOG_ALERT)
-			? DialogType::Alert
-			: DialogType::Confirm;
+			const auto dialogType = (type == WEBKIT_SCRIPT_DIALOG_PROMPT)
+				? DialogType::Prompt
+				: (type == WEBKIT_SCRIPT_DIALOG_ALERT)
+				? DialogType::Alert
+				: DialogType::Confirm;
 
-		const auto result = _dialogHandler(DialogArgs{
-			.type = dialogType,
-			.value = value,
-			.text = text,
+			const auto result = _dialogHandler(DialogArgs{
+				.type = dialogType,
+				.value = value,
+				.text = text,
+			});
+
+			_master.complete_script_dialog(
+				invocation,
+				result.accepted,
+				result.text);
 		});
-
-		_master.complete_script_dialog(
-			invocation,
-			result.accepted,
-			result.text);
 
 		return true;
 	});
