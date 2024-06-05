@@ -6,6 +6,7 @@
 //
 #pragma once
 
+#include <QtCore/QThread>
 #include <QtWaylandCompositor/QWaylandQuickCompositor>
 
 class QQuickWidget;
@@ -15,6 +16,7 @@ namespace Webview {
 class Compositor : public QWaylandQuickCompositor {
 public:
 	Compositor(const QByteArray &socketName = {});
+	~Compositor();
 
 	void setWidget(QQuickWidget *widget);
 
@@ -24,6 +26,35 @@ private:
 
 	struct Private;
 	const std::unique_ptr<Private> _private;
+};
+
+class CompositorThread : public QThread {
+public:
+	template <typename ...Args>
+	CompositorThread(Args... args) {
+		connect(this, &QThread::started, [=] {
+			_compositor.emplace(args...);
+		});
+
+		connect(this, &QThread::finished, [=] {
+			_compositor.reset();
+		});
+
+		start();
+	}
+
+	~CompositorThread() {
+		quit();
+		wait();
+	}
+
+	[[nodiscard]] Compositor &get() {
+		return *_compositor;
+	}
+
+private:
+	std::optional<Compositor> _compositor;
+
 };
 
 } // namespace Webview

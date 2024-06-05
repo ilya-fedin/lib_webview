@@ -17,6 +17,8 @@
 #include <QtWaylandCompositor/QWaylandQuickOutput>
 #include <QtWaylandCompositor/QWaylandQuickShellSurfaceItem>
 
+#include <crl/crl.h>
+
 namespace Webview {
 
 struct Compositor::Private {
@@ -47,6 +49,10 @@ public:
 	}
 
 private:
+	QWaylandSurface _surfaceProxy;
+	QWaylandXdgSurface _xdgSurfaceProxy;
+	rpl::event_stream<> _xdgToplevelTitleChangedProxy;
+	rpl::event_stream<> _xdgToplevelFullscreenChangedProxy;
 	QQuickItem _moveItem;
 	rpl::variable<bool> _completed = false;
 	rpl::lifetime _lifetime;
@@ -54,23 +60,33 @@ private:
 
 class Compositor::Output : public QWaylandQuickOutput {
 public:
-	Output(Compositor *compositor, QObject *parent = nullptr)
-	: _xdg(this, &compositor->_private->xdgOutput) {
-		const auto xdgSurface = qobject_cast<QWaylandXdgSurface*>(parent);
-		const auto window = qobject_cast<QQuickWindow*>(parent);
-		setParent(parent);
+	Output(
+			Compositor *compositor,
+			QQuickWindow *window,
+			QWaylandXdgSurface *xdgSurface = nullptr)
+	: _xdg(this, &compositor->_private->xdgOutput)
+	, _windowFollowsSize(xdgSurface) {
+		connect(window, &QObject::destroyed, this, [=] { delete this; });
 		setCompositor(compositor);
-		setWindow(window ? window : &_ownedWindow.emplace());
+		setWindow(window);
 		setScaleFactor(this->window()->devicePixelRatio());
 		setSizeFollowsWindow(true);
 		this->window()->setProperty("output", QVariant::fromValue(this));
 #if QT_VERSION >= QT_VERSION_CHECK(6, 6, 0)
-		base::install_event_filter(this, this->window(), [=](
-				not_null<QEvent*> e) {
-			if (e->type() == QEvent::DevicePixelRatioChange) {
-				setScaleFactor(this->window()->devicePixelRatio());
-			}
-			return base::EventFilterResult::Continue;
+		const auto guard = QPointer(this);
+		crl::on_main(this, [=] {
+			base::install_event_filter(this->window(), [=](
+					not_null<QEvent*> e) {
+				if (e->type() == QEvent::DevicePixelRatioChange) {
+					QMetaObject::invokeMethod(this, [=] {
+						if (!guard) {
+							return;
+						}
+						setScaleFactor(this->window()->devicePixelRatio());
+					});
+				}
+				return base::EventFilterResult::Continue;
+			});
 		});
 #endif // Qt >= 6.6.0
 		rpl::single(rpl::empty) | rpl::then(
@@ -101,17 +117,23 @@ public:
 		return _chrome;
 	}
 
-	void setXdgSurface(QWaylandXdgSurface *xdgSurface) {
-		if (xdgSurface) {
-			_chrome.emplace(this, window(), xdgSurface, bool(_ownedWindow));
-		} else {
-			_chrome.reset();
-		}
+	void setXdgSurface(QPointer<QWaylandXdgSurface> xdgSurface) {
+		crl::on_main(this, [=] {
+			if (xdgSurface) {
+				_chrome.emplace(
+					this,
+					window(),
+					xdgSurface,
+					_windowFollowsSize);
+			} else {
+				_chrome.reset();
+			}
+		});
 	}
 
 private:
 	QWaylandXdgOutputV1 _xdg;
-	std::optional<QQuickWindow> _ownedWindow;
+	const bool _windowFollowsSize = false;
 	base::unique_qptr<Chrome> _chrome;
 	rpl::lifetime _lifetime;
 };
@@ -122,12 +144,7 @@ Compositor::Chrome::Chrome(
 		QWaylandXdgSurface *xdgSurface,
 		bool windowFollowsSize)
 : QWaylandQuickShellSurfaceItem(window->contentItem()) {
-	base::qt_signal_producer(
-		xdgSurface,
-		&QObject::destroyed
-	) | rpl::start_with_next([=] {
-		delete this;
-	}, _lifetime);
+	connect(xdgSurface, &QObject::destroyed, this, [=] { delete this; });
 
 	rpl::single(rpl::empty) | rpl::then(
 		base::qt_signal_producer(
@@ -149,11 +166,13 @@ Compositor::Chrome::Chrome(
 			return base::EventFilterResult::Continue;
 		}
 		e->ignore();
-		if (const auto toplevel = xdgSurface->toplevel()) {
-			toplevel->sendClose();
-		} else if (const auto popup = xdgSurface->popup()) {
-			popup->sendPopupDone();
-		}
+		QMetaObject::invokeMethod(xdgSurface, [=] {
+			if (const auto toplevel = xdgSurface->toplevel()) {
+				toplevel->sendClose();
+			} else if (const auto popup = xdgSurface->popup()) {
+				popup->sendPopupDone();
+			}
+		});
 		return base::EventFilterResult::Cancel;
 	});
 
@@ -174,19 +193,33 @@ Compositor::Chrome::Chrome(
 	) | rpl::filter([=](const QSize &size) {
 		return !size.isEmpty();
 	}) | rpl::start_with_next([=](const QSize &size) {
-		if (const auto toplevel = xdgSurface->toplevel()) {
-			toplevel->sendFullscreen(size);
-		}
+		QMetaObject::invokeMethod(xdgSurface, [=] {
+			if (const auto toplevel = xdgSurface->toplevel()) {
+				toplevel->sendFullscreen(size);
+			}
+		});
 	}, _lifetime);
+
+	connect(
+		xdgSurface->surface(),
+		&QWaylandSurface::destinationSizeChanged,
+		&_surfaceProxy,
+		&QWaylandSurface::destinationSizeChanged);
+
+	connect(
+		xdgSurface,
+		&QWaylandXdgSurface::windowGeometryChanged,
+		&_xdgSurfaceProxy,
+		&QWaylandXdgSurface::windowGeometryChanged);
 
 	rpl::single(rpl::empty) | rpl::then(
 		rpl::merge(
 			base::qt_signal_producer(
-				xdgSurface->surface(),
+				&_surfaceProxy,
 				&QWaylandSurface::destinationSizeChanged
 			),
 			base::qt_signal_producer(
-				xdgSurface,
+				&_xdgSurfaceProxy,
 				&QWaylandXdgSurface::windowGeometryChanged
 			)
 		)
@@ -214,28 +247,40 @@ Compositor::Chrome::Chrome(
 	}, _lifetime);
 
 	if (const auto toplevel = xdgSurface->toplevel()) {
+		connect(
+			toplevel,
+			&QWaylandXdgToplevel::titleChanged,
+			this,
+			[=] {
+				_xdgToplevelTitleChangedProxy.fire({});
+			});
+
 		rpl::single(rpl::empty) | rpl::then(
-			base::qt_signal_producer(
-				toplevel,
-				&QWaylandXdgToplevel::titleChanged
-			)
+			_xdgToplevelTitleChangedProxy.events()
 		) | rpl::map([=] {
 			return toplevel->title();
 		}) | rpl::start_with_next([=](const QString &title) {
 			window->setTitle(title);
 		}, _lifetime);
 
+		connect(
+			toplevel,
+			&QWaylandXdgToplevel::fullscreenChanged,
+			this,
+			[=] {
+				_xdgToplevelFullscreenChangedProxy.fire({});
+			});
+
 		rpl::single(rpl::empty) | rpl::then(
-			base::qt_signal_producer(
-				toplevel,
-				&QWaylandXdgToplevel::fullscreenChanged
-			)
+			_xdgToplevelFullscreenChangedProxy.events()
 		) | rpl::map([=] {
 			return toplevel->fullscreen();
 		}) | rpl::start_with_next([=](bool fullscreen) {
-			if (!fullscreen) {
-				toplevel->sendFullscreen(window->size());
-			}
+			QMetaObject::invokeMethod(toplevel, [=] {
+				if (!fullscreen) {
+					toplevel->sendFullscreen(window->size());
+				}
+			});
 		}, _lifetime);
 	}
 }
@@ -246,11 +291,22 @@ Compositor::Compositor(const QByteArray &socketName)
 			QWaylandXdgToplevel *toplevel,
 			QWaylandXdgSurface *xdgSurface) {
 		if (!_private->output || _private->output->chrome()) {
-			const auto output = new Output(this, xdgSurface);
+			crl::on_main([=] {
+				const auto window = new QQuickWindow;
+				connect(xdgSurface, &QObject::destroyed, window, [=] {
+					delete window;
+				});
 
-			output->chrome()->surfaceCompleted() | rpl::start_with_next([=] {
-				output->window()->show();
-			}, _private->lifetime);
+				QMetaObject::invokeMethod(xdgSurface, [=] {
+					const auto output = new Output(this, window, xdgSurface);
+					crl::on_main(output, [=] {
+						output->chrome()->surfaceCompleted(
+						) | rpl::start_with_next([=] {
+							window->show();
+						}, _private->lifetime);
+					});
+				});
+			});
 		} else {
 			_private->output->setXdgSurface(xdgSurface);
 		}
@@ -259,38 +315,45 @@ Compositor::Compositor(const QByteArray &socketName)
 	connect(&_private->shell, &QWaylandXdgShell::popupCreated, [=](
 			QWaylandXdgPopup *popup,
 			QWaylandXdgSurface *xdgSurface) {
-		const auto widget = _private->widget;
-		const auto parent = (*static_cast<QQuickWindow * const *>(
-			popup->parentXdgSurface()->property("window").constData()
-		));
-		const auto output = (*static_cast<Output * const *>(
-			parent->property("output").constData()
-		));
-		const auto window = new QQuickWindow;
-		static_cast<QObject*>(window)->setParent(xdgSurface);
-		window->setProperty("output", QVariant::fromValue(output));
-		const auto chrome = new Chrome(output, window, xdgSurface, true);
+		crl::on_main(xdgSurface, [=] {
+			const auto widget = _private->widget;
+			const auto parent = (*static_cast<QQuickWindow * const *>(
+				popup->parentXdgSurface()->property("window").constData()
+			));
+			const auto output = (*static_cast<Output * const *>(
+				parent->property("output").constData()
+			));
+			const auto window = new QQuickWindow;
+			connect(xdgSurface, &QObject::destroyed, window, [=] {
+				delete window;
+			});
+			window->setProperty("output", QVariant::fromValue(output));
+			const auto chrome = new Chrome(output, window, xdgSurface, true);
 
-		chrome->surfaceCompleted() | rpl::start_with_next([=] {
-			if (widget && parent == widget->quickWindow()) {
-				window->setTransientParent(widget->window()->windowHandle());
-				window->setPosition(
-					popup->unconstrainedPosition()
-						+ widget->mapToGlobal(QPoint()));
-			} else {
-				window->setTransientParent(parent);
-				window->setPosition(
-					popup->unconstrainedPosition() + parent->position());
-			}
-			window->setFlag(Qt::Popup);
-			window->setColor(Qt::transparent);
-			window->show();
-		}, _private->lifetime);
+			chrome->surfaceCompleted() | rpl::start_with_next([=] {
+				if (widget && parent == widget->quickWindow()) {
+					window->setTransientParent(
+						widget->window()->windowHandle());
+					window->setPosition(
+						popup->unconstrainedPosition()
+							+ widget->mapToGlobal(QPoint()));
+				} else {
+					window->setTransientParent(parent);
+					window->setPosition(
+						popup->unconstrainedPosition() + parent->position());
+				}
+				window->setFlag(Qt::Popup);
+				window->setColor(Qt::transparent);
+				window->show();
+			}, _private->lifetime);
+		});
 	});
 
 	setSocketName(socketName);
 	create();
 }
+
+Compositor::~Compositor() = default;
 
 void Compositor::setWidget(QQuickWidget *widget) {
 	_private->widget = widget;

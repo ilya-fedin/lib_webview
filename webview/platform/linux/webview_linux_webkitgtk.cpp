@@ -117,7 +117,7 @@ private:
 
 	bool _wayland = false;
 	::base::unique_qptr<QWidget> _widget;
-	QPointer<Compositor> _compositor;
+	QPointer<CompositorThread> _compositor;
 
 	GtkWidget *_window = nullptr;
 	GtkWidget *_x11SizeFix = nullptr;
@@ -207,8 +207,11 @@ bool Instance::create(Config config) {
 			const auto widget = static_cast<QQuickWidget*>(_widget.get());
 			widget->setAttribute(Qt::WA_AlwaysStackOnTop);
 			widget->setClearColor(Qt::transparent);
-			_compositor->setWidget(widget);
 			widget->show();
+			const auto compositor = QPointer(&_compositor->get());
+			QMetaObject::invokeMethod(compositor, [=] {
+				compositor->setWidget(widget);
+			});
 		}
 
 		if (!_helper) {
@@ -734,7 +737,7 @@ void Instance::startProcess() {
 	}
 
 	if (_wayland && !_compositor) {
-		_compositor = new Compositor(
+		_compositor = new CompositorThread(
 			QByteArray::fromStdString(
 				GLib::path_get_basename(socketPath + "-wayland")));
 	}
@@ -862,7 +865,9 @@ void Instance::registerMasterMethodHandlers() {
 			}
 
 			return std::string();
-		}(), _compositor ? _compositor->socketName().toStdString() : "");
+		}(), _compositor
+			? _compositor->get().socketName().toStdString()
+			: "");
 		return true;
 	});
 
