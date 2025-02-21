@@ -618,12 +618,22 @@ void Instance::dataRequest(WebKitURISchemeRequest *request) {
 		return;
 	}
 
+	auto prepared = DataRequest{
+		.id = webkit_uri_scheme_request_get_path(request) + 1,
+	};
+
+	if (auto headers = webkit_uri_scheme_request_get_http_headers(request)) {
+		if (const auto range = soup_message_headers_get_one(headers, "Range")) {
+			ParseRangeHeaderFor(prepared, range);
+		}
+	}
+
 	g_object_ref(request);
 	_master.call_data_request(
 		uintptr_t(request),
-		webkit_uri_scheme_request_get_path(request) + 1,
-		0,
-		0,
+		prepared.id,
+		prepared.offset,
+		prepared.limit,
 		[=](GObject::Object source_object, Gio::AsyncResult res) {
 			const auto ret = _master.call_data_request_finish(res);
 			if (!ret || DataResult(std::get<1>(*ret)) == DataResult::Failed) {
@@ -681,6 +691,33 @@ void Instance::dataResponse(
 	const auto response = webkit_uri_scheme_response_new(
 		G_INPUT_STREAM(stream.gobj_()),
 		size);
+
+	if (requestedOffset > 0 || total != size) {
+		const auto headers = soup_message_headers_new(
+			SOUP_MESSAGE_HEADERS_RESPONSE);
+		soup_message_headers_append(headers, "Accept-Ranges", "bytes");
+		soup_message_headers_append(headers, "Cache-Control", "no-store");
+		soup_message_headers_append(
+			headers,
+			"Content-Length",
+			std::to_string(size).c_str());
+		soup_message_headers_append(
+			headers,
+			"Content-Range",
+			std::string(
+				"bytes "
+					+ std::to_string(requestedOffset)
+					+ '-'
+					+ std::to_string(requestedOffset + size - 1)
+					+ '/'
+					+ std::to_string(total)).c_str());
+
+		webkit_uri_scheme_response_set_http_headers(response, headers);
+		webkit_uri_scheme_response_set_status(
+			response,
+			206,
+			"Partial Content");
+	}
 
 	webkit_uri_scheme_response_set_content_type(response, mime.c_str());
 	webkit_uri_scheme_request_finish_with_response(request, response);
@@ -1557,6 +1594,7 @@ Available Availability() {
 	const auto success = (resolved == ResolveResult::Success);
 	return Available{
 		.customSchemeRequests = success,
+		.customRangeRequests = success,
 		.customReferer = success,
 	};
 }
