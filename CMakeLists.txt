@@ -58,7 +58,12 @@ PUBLIC
 )
 
 if (WIN32)
-    nuget_add_webview(lib_webview)
+    find_package(unofficial-webview2 QUIET)
+    if (unofficial-webview2_FOUND)
+        target_link_libraries(lib_webview PRIVATE unofficial::webview2::webview2)
+    else()
+        nuget_add_webview(lib_webview)
+    endif()
 elseif (LINUX)
     include(${cmake_helpers_loc}/external/glib/generate_dbus.cmake)
     generate_dbus(lib_webview org.desktop_app.GtkIntegration.Webview. Webview ${src_loc}/webview/platform/linux/webview_linux_interface.xml)
